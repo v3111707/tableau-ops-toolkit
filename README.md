@@ -4,4 +4,4 @@ It streamlines administrative workflows like workbook backups, S3 synchronizatio
 
 Included Tools:
 - tableau-wb-backup2s3 — incremental Tableau workbook backup to S3 with state tracking, metadata tagging, and monitoring via Zabbix and Sentry.
-
+- tableau-full-backup2s3 — automates full Tableau Server backups, uploads them to AWS S3 for secure storage, and provides monitoring through Zabbix.
