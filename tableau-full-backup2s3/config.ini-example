@@ -1,0 +1,19 @@
+[Logging]
+#https://docs.python.org/3/library/logging.handlers.html#logging.handlers.RotatingFileHandler
+level = info
+debug = False
+filename = full-backup2s3.log
+max_bytes = 52428800
+backup_count = 6
+
+[Backup]
+backup_file = ts_backup
+append_timestamp = True
+multithreaded = True
+backup_dir = /var/opt/tableau/tableau_server/data/tabsvc/files/backups
+
+[AWS]
+bucket_name = my_backet
+
+[Zabbix]
+config_file = /etc/zabbix/zabbix_agentd.conf
