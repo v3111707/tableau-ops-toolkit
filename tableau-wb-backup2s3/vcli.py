@@ -123,7 +123,6 @@ def main():
         role_id=config['vault']['role_id'],
         secret_id=config['vault']['secret_id'],
     )
-    creds = vault_client.secrets.kv.v1.read_secret(config['vault']['paths']['creds'])['data']
     params = vault_client.secrets.kv.v1.read_secret(config['vault']['paths']['params'])['data']
     ts_creds = vault_client.secrets.kv.v1.read_secret(config['vault']['paths']['ts_creds'])['data']
 
@@ -145,7 +144,6 @@ def main():
     try:
         wb2s3 = BackupWB2S3(
             tableau_cred=(ts_creds['username'], ts_creds['password'], ts_creds['url']),
-            s3_creds=(creds['s3_key_id'], creds['s3_access_key']),
             work_dir=config['main']['workdir'],
             failed_q=failed_q,
             successful_q=successful_q
@@ -173,10 +171,10 @@ def main():
 
     zab_sender.send(ZAB_KEY_UNBACKUPED, str(failed_q.qsize()))
     if not failed_q.empty():
-        zab_sender.send(ZAB_KEY_EXITCODE, 1)
+        zab_sender.send(ZAB_KEY_EXITCODE, "1")
         print('There was the next errors:')
     else:
-        zab_sender.send(ZAB_KEY_EXITCODE, 0)
+        zab_sender.send(ZAB_KEY_EXITCODE, "0")
 
     logger.info('##### REPORT #####')
 
@@ -185,23 +183,23 @@ def main():
 
     backed_up_report = []
     while not successful_q.empty():
-        wb = successful_q.get()
-        backed_up_report.append(f'| {wb.site} | {wb.project} | {wb.name} |')
-        # logger.info(f'| {wb.site} | {wb.project} | {wb.name} |')
-        all_wb_size += wb.size
+        item = successful_q.get()
+        backed_up_report.append(f'| {item.site} | {item.project} | {item.name} |')
+        # logger.info(f'| {item.site} | {item.project} | {item.name} |')
+        all_wb_size += item.size
     logger.info(f'“Backed up workbooks:\n|| site || project || name ||\n{'\n'.join(backed_up_report)} ')
 
     failed_report = []
     while not failed_q.empty():
-        e, wb = failed_q.get()
-        if wb:
-            failed_report.append(f'| {wb.site} | {wb.project} | {wb.name} | {wb.id} | {e} |')
-            # logger.info(f'| {wb.site} | {wb.project} | {wb.name} | {e} |')
+        e, item = failed_q.get()
+        if item:
+            failed_report.append(f'| {item.site} | {item.project} | {item.name} | {item.id} | {e} |')
+            # logger.info(f'| {item.site} | {item.project} | {item.name} | {e} |')
         else:
             logger.info(e)
     logger.info(f'“Failed workbooks:\n|| site || project || name || id || error ||\n{'\n'.join(failed_report)} ')
 
-    zab_sender.send(ZAB_KEY_FILESSIZE, all_wb_size * 1048576)
+    zab_sender.send(ZAB_KEY_FILESSIZE, str(all_wb_size * 1048576))
 
 if __name__ == '__main__':
     main()

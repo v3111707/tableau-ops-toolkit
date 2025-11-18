@@ -1,3 +1,5 @@
+from operator import itemgetter
+
 import boto3
 import logging
 import os
@@ -13,6 +15,8 @@ import tableauserverclient as TSC
 from concurrent.futures import ThreadPoolExecutor
 from queue import SimpleQueue
 from tableauserverclient.models.workbook_item import WorkbookItem
+from tableauserverclient.models.datasource_item import DatasourceItem
+
 from sentry_sdk import add_breadcrumb
 from sentry_sdk.scrubber import DEFAULT_DENYLIST
 
@@ -28,7 +32,7 @@ SENTRY_DENYLIST = DEFAULT_DENYLIST + [
 
 
 @dataclass
-class Workbook:
+class BackupItem:
     name: str
     id: str
     project: str
@@ -78,10 +82,6 @@ class BackupWB2S3:
         tableau credentials
         Example: (username, password, url)
 
-    s3_creds : tuple
-        AWS credentials
-        Example: (key_id, access_key, bucket name)
-
     work_dir: str
         Folder where script downloads files before uploading to AWS S3.
 
@@ -95,7 +95,6 @@ class BackupWB2S3:
     def __init__(
             self,
             tableau_cred: tuple,
-            s3_creds: tuple,
             work_dir: str,
             failed_q: SimpleQueue = None,
             successful_q: SimpleQueue = None,
@@ -115,7 +114,6 @@ class BackupWB2S3:
         self.wb_name_s3_object = {}
 
         tab_user, tab_pass, tab_url = tableau_cred
-        key_id, access_key = s3_creds
 
         add_breadcrumb(
             category='__init__',
@@ -139,19 +137,15 @@ class BackupWB2S3:
 
         self.s3_client = boto3.client(
             service_name='s3',
-            aws_access_key_id=key_id,
-            aws_secret_access_key=access_key,
         )
 
         self.s3_resource = boto3.resource(
             service_name='s3',
-            aws_access_key_id=key_id,
-            aws_secret_access_key=access_key,
         )
-        # self._fill_user_id_username()
+        # self.logger.debug(f"{boto3.client("sts").get_caller_identity()=}")
 
-    def _get_wb_path(self, wb: WorkbookItem):
-        return self.current_site_name + '/' + self.project_id_path[wb.project_id] + wb.name
+    def _get_ts_item_path(self, ts_item):
+        return self.current_site_name + '/' + self.project_id_path[ts_item.project_id] + ts_item.name
 
     def _fill_user_id_username(self):
         ts_users = []
@@ -200,82 +194,89 @@ class BackupWB2S3:
         else:
             self.logger.warning(f'Site {site_name} not found')
 
-    def _ts_get_all_workbooks(self):
-        return list(TSC.Pager(self.ts.workbooks))
-
     @retry
-    def _ts_download_wb(self, wb: WorkbookItem, include_extract: bool = True):
-        file_path = os.path.join(self.work_dir, wb.id)
-        self.logger.info(f' download:{wb.project_name} / {wb.name} ({wb.id})')
-        return self.ts.workbooks.download(
-            workbook_id=wb.id,
-            include_extract=include_extract,
-            filepath=file_path,
-        )
+    def _ts_download_item(self, item, include_extract: bool = True):
+        file_path = os.path.join(self.work_dir, item.id)
+        self.logger.info(f' download:{item.project_name} / {item.name} ({item.id})')
+
+        match item:
+            case WorkbookItem():
+                return self.ts.workbooks.download(
+                    workbook_id=item.id,
+                    include_extract=include_extract,
+                    filepath=file_path,
+                )
+            case DatasourceItem():
+                return self.ts.datasources.download(
+                    datasource_id=item.id,
+                    include_extract=include_extract,
+                    filepath=file_path,
+                )
+        raise Exception("Unsupported type")
 
     @print_and_send_exceptions_sentry
-    def _do_backup(self, wb: WorkbookItem, include_extract: bool = True):
-        wb_path = self._get_wb_path(wb)
+    def _do_backup(self, item, include_extract: bool = True):
+        item_path = self._get_ts_item_path(item)
 
         try:
-            file_path = self._ts_download_wb(
-                wb=wb,
+            file_path = self._ts_download_item(
+                item=item,
                 include_extract=include_extract
             )
         except Exception:
-            self.logger.warning(f'{wb.name} download failed. Try with include_extract=False')
+            self.logger.warning(f'{item.name} download failed. Try with include_extract=False')
             include_extract = False
-            file_path = self._ts_download_wb(
-                wb=wb,
+            file_path = self._ts_download_item(
+                item=item,
                 include_extract=include_extract
             )
 
-        obj_key = wb_path + '.' + file_path[-7:].split('.')[1]
+        obj_key = item_path + '.' + file_path[-7:].split('.')[1]
         tags = {
-            'tab_owner': self.user_id_username.get(wb.owner_id),
-            'tab_id': wb.id,
-            'tab_created_at': wb.created_at.strftime(self._time_format),
-            'tab_updated_at': wb.updated_at.strftime(self._time_format),
-            'tab_description': self.convert_to_s3_compliant_tag(wb.description)[:256] if wb.description else '',
+            'tab_owner': self.user_id_username.get(item.owner_id),
+            'tab_id': item.id,
+            'tab_created_at': item.created_at.strftime(self._time_format),
+            'tab_updated_at': item.updated_at.strftime(self._time_format),
+            'tab_description': self.convert_to_s3_compliant_tag(item.description)[:256] if item.description else '',
         }
         self._s3_upload(
             file_path=file_path,
             object_key=obj_key,
             tags=tags
         )
-        if include_extract or self._download_error_ignore_tag in wb.tags:
-            self.upload_state[wb_path] = {
-                'id': wb.id,
-                'name': wb.name,
-                'created_at': wb.created_at.strftime(self._time_format),
-                'updated_at': wb.updated_at.strftime(self._time_format),
+        if include_extract or self._download_error_ignore_tag in item.tags:
+            self.upload_state[item_path] = {
+                'id': item.id,
+                'name': item.name,
+                'created_at': item.created_at.strftime(self._time_format),
+                'updated_at': item.updated_at.strftime(self._time_format),
                 'upload_date': datetime.date.today().strftime(self._date_format),
                 'object_key': obj_key,
             }
         os.remove(file_path)
 
-    def _backup_wb(self, wb: WorkbookItem):
-        workbook = Workbook(
-            name=wb.name,
-            project=wb.project_name,
-            id=wb.id,
-            size=wb.size,
+    def _backup_item(self, item):
+        backup_item = BackupItem(
+            name=item.name,
+            project=item.project_name,
+            id=item.id,
+            size=item.size,
             site=self.current_site_name,
         )
-        self.logger.info(f'Backup "{wb.project_name}"/"{wb.name}" ({wb.id}), {wb.size} MB"')
+        self.logger.info(f'Backup "{item.project_name}"/"{item.name}" ({item.id}), {item.size} MB"')
         with sentry_sdk.new_scope() as scope:
             scope.add_breadcrumb(
                 category='_backup',
-                message=f'Backup(project / wb (id)): {wb.project_name} / {wb.name} ({wb.id})',
+                message=f'Backup(project / wb (id)): {item.project_name} / {item.name} ({item.id})',
                 level='info',
                 type='debug',
             )
             try:
-                self._do_backup(wb)
+                self._do_backup(item)
             except Exception as e:
-                self.failed_q.put((e, workbook))
+                self.failed_q.put((e, backup_item))
             else:
-                self.successful_q.put(workbook)
+                self.successful_q.put(backup_item)
 
     def full_backup(
             self,
@@ -332,43 +333,45 @@ class BackupWB2S3:
 
         queue_to_backup = []
 
-        all_wbs = self._ts_get_all_workbooks()
+        all_wbs = list(TSC.Pager(self.ts.workbooks))
+        all_dss = list(TSC.Pager(self.ts.datasources))
         if projects:
             all_wbs = [w for w in all_wbs if w.project_id in project_ids_to_backup]
-        all_wbs_paths = [self._get_wb_path(w) for w in all_wbs]
+            all_dss = [d for d in all_dss if d.project_id in project_ids_to_backup]
+        all_items_paths = [self._get_ts_item_path(w) for w in all_wbs] + [self._get_ts_item_path(d) for d in all_dss]
 
-        for wb_path, wb_data in [(k, v) for k, v in self.upload_state.items() if k not in all_wbs_paths]:
-            self.logger.info(f'"{wb_data['object_key']}" no longer exists on the TS. Update Last modified field in S3')
-            self._s3_update_last_modified(wb_data['object_key'])
-            self.upload_state.pop(wb_path)
+        for item_path, item_data in [(k, v) for k, v in self.upload_state.items() if k not in all_items_paths]:
+            self.logger.info(f'"{item_data['object_key']}" no longer exists on the TS. Update Last modified field in S3')
+            self._s3_update_last_modified(item_data['object_key'])
+            self.upload_state.pop(item_path)
 
-        for wb in all_wbs:
-            wb_path = self._get_wb_path(wb)
+        for item in all_dss + all_wbs:
+            item_path = self._get_ts_item_path(item)
 
-            if self.upload_state.get(wb_path) and all([
-                self.upload_state[wb_path]['id'] == wb.id,
-                self.upload_state[wb_path]['updated_at'] == wb.updated_at.strftime(self._time_format),
-                self.upload_state[wb_path]['created_at'] == wb.created_at.strftime(self._time_format),
+            if self.upload_state.get(item_path) and all([
+                self.upload_state[item_path]['id'] == item.id,
+                self.upload_state[item_path]['updated_at'] == item.updated_at.strftime(self._time_format),
+                self.upload_state[item_path]['created_at'] == item.created_at.strftime(self._time_format),
             ]):
-                self.logger.debug(f'"{wb_path}" already in S3 and has the same metadata. Ignore')
+                self.logger.debug(f'"{item_path}" already in S3 and has the same metadata. Ignore')
             else:
-                if self.upload_state.get(wb_path):
+                if self.upload_state.get(item_path):
                     msg_parts = []
-                    if self.upload_state[wb_path]['id'] != wb.id:
-                        msg_parts.append(f'wb id was changed: {self.upload_state[wb_path]['id']} -> {wb.id}')
-                    elif self.upload_state[wb_path]['updated_at'] != wb.updated_at.strftime(self._time_format):
+                    if self.upload_state[item_path]['id'] != item.id:
+                        msg_parts.append(f'wb id was changed: {self.upload_state[item_path]['id']} -> {item.id}')
+                    elif self.upload_state[item_path]['updated_at'] != item.updated_at.strftime(self._time_format):
                         msg_parts.append(
-                            f'wb updated_at was changed: {self.upload_state[wb_path]['updated_at']} -> {wb.updated_at.strftime(self._time_format)}'
+                            f'wb updated_at was changed: {self.upload_state[item_path]['updated_at']} -> {item.updated_at.strftime(self._time_format)}'
                         )
-                    elif self.upload_state[wb_path]['created_at'] == wb.created_at.strftime(self._time_format):
+                    elif self.upload_state[item_path]['created_at'] == item.created_at.strftime(self._time_format):
                         msg_parts.append(
-                            f'wb created_at was changed: {self.upload_state[wb_path]['created_at']} -> {wb.created_at.strftime(self._time_format)}'
+                            f'wb created_at was changed: {self.upload_state[item_path]['created_at']} -> {item.created_at.strftime(self._time_format)}'
                         )
-                    self.logger.info(f'"{wb_path}": ' + ' ,'.join(msg_parts))
-                queue_to_backup.append(wb)
+                    self.logger.info(f'"{item_path}": ' + ' ,'.join(msg_parts))
+                queue_to_backup.append(item)
 
         with ThreadPoolExecutor(max_workers=max_workers) as tpe:
-            resp = [tpe.submit(self._backup_wb, wb) for wb in queue_to_backup]
+            resp = [tpe.submit(self._backup_item, item) for item in queue_to_backup]
         for r in resp:
             if r.exception():
                 self.logger.exception(r.exception())
