@@ -23,7 +23,7 @@ This script automates the process of creating a full backup of your Tableau Serv
 
 ## Installation
 
-1**Install the required Python library:**
+1** Install the required Python library:**
     ```bash
     pip install -r requirements.txt
     ```
